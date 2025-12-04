@@ -6,92 +6,42 @@ from scipy import sparse
 from PIL import Image
 import shutil
 import subprocess
-from concurrent.futures import ProcessPoolExecutor
-import functools
+from tqdm import tqdm
 
-# Global variables for worker processes
-A_ub_global = None
-c_global = None
 
 def ensure_output_dir(path):
     os.makedirs(path, exist_ok=True)
 
 
-def init_worker(A_ub, c):
-    """Initialize worker process with shared read-only data."""
-    global A_ub_global, c_global
-    A_ub_global = A_ub
-    c_global = c
-
-
-def solve_frame_task(image_vals):
-    """Solve LP for a single frame using global A_ub and c."""
-    # Reconstruct b_ub_vec for this specific frame
-    b_ub_vec = np.concatenate((-image_vals, image_vals))
-    
-    res = linprog(c_global, A_ub=A_ub_global, b_ub=b_ub_vec, bounds=(None, None), method='highs-ipm')
-    
-    if res.success:
-        return res.x[-1]
-    else:
-        return 1.0
-
-
 def compute_foreground(X, b_estime):
-    p_full, t = X.shape
-    
-    # Optimization: Filter out pixels where background is negligible
-    # This significantly reduces the number of constraints in the LP
-    threshold = 1e-5
-    mask = np.abs(b_estime) > threshold
-    
-    # If too few pixels are significant, we might want to fallback or warn, 
-    # but for now we proceed with the reduced set.
-    if np.sum(mask) == 0:
-        print("Warning: b_estime is all zeros. Returning original X.")
-        return X
+    p, t = X.shape
 
-    X_reduced = X[mask, :]
-    b_reduced = b_estime[mask]
-    
-    p = X_reduced.shape[0]
-    print(f"Reduced problem size from {p_full} to {p} pixels per frame.")
-
-    # Construct LP matrices for the reduced problem
     c = np.ones(p + 1)
     c[-1] = 0
 
     diag_neg = -sparse.eye(p, format='csc')
     A_v = sparse.vstack([diag_neg, diag_neg])
 
-    vec_b_neg = -b_reduced.reshape((p, 1))
-    vec_b_pos = b_reduced.reshape((p, 1))
+    vec_b_neg = -b_estime.reshape((p, 1))
+    vec_b_pos = b_estime.reshape((p, 1))
     A_b = np.vstack([vec_b_neg, vec_b_pos])
     A_b_sparse = sparse.csc_matrix(A_b)
 
     A_ub = sparse.hstack([A_v, A_b_sparse], format='csc')
 
-    # Prepare tasks
-    tasks = [X_reduced[:, j] for j in range(t)]
-    
     a_estime = np.zeros(t)
-    
-    # Use all available cores
-    max_workers = os.cpu_count()
-    print(f"Processing {t} frames using {max_workers} workers...")
-    
-    try:
-        from tqdm import tqdm
-        with ProcessPoolExecutor(max_workers=max_workers, initializer=init_worker, initargs=(A_ub, c)) as executor:
-            results = list(tqdm(executor.map(solve_frame_task, tasks), total=len(tasks), unit="frame"))
-    except ImportError:
-        print("tqdm not installed, using simple progress print.")
-        with ProcessPoolExecutor(max_workers=max_workers, initializer=init_worker, initargs=(A_ub, c)) as executor:
-            results = list(executor.map(solve_frame_task, tasks))
-    
-    a_estime = np.array(results)
-    
-    # Compute F using the full original X and b_estime
+
+    for j in tqdm(range(t), desc="Processing frames", unit="frame"):
+        image_vals = X[:, j]
+        b_ub_vec = np.concatenate((-image_vals, image_vals))
+
+        res = linprog(c, A_ub=A_ub, b_ub=b_ub_vec, bounds=(None, None), method='highs-ipm')
+
+        if res.success:
+            a_estime[j] = res.x[-1]
+        else:
+            a_estime[j] = 1.0
+
     F = X - np.outer(b_estime, a_estime)
     return F
 
